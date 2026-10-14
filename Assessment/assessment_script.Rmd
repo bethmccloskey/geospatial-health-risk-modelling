@@ -1,0 +1,882 @@
+---
+title: "Spatial Epidemiology of Sanitation and Childhood Malaria in Côte d'Ivoire"
+subtitle: "Exploratory Spatial Data Analysis, Geostatistical Modeling, and Population-at-Risk Estimation"
+author: "Beth (MSc Public Health / Spatial Epidemiology)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+# Introduction and Overview
+
+This reproducible research notebook conducts a comprehensive spatial epidemiological analysis using data from the **2021 Côte d'Ivoire Demographic and Health Survey (DHS)**.
+
+The analysis is divided into two primary investigations:
+1. **Section 1: Exploratory Spatial Data Analysis (ESDA) of Open Defecation**
+   - Department-level (Admin 2, $n = 106$) spatial pattern exploration.
+   - Spatial weights matrix construction using Queen contiguity.
+   - Global Moran's $I$ test with 9,999 Monte Carlo permutations.
+   - Local Moran's $I$ (LISA) hotspot, coldspot, and spatial outlier detection.
+2. **Section 2: Geostatistical Modeling and Population Risk Estimation for Childhood Malaria**
+   - Cluster-level ($n = 468$) Rapid Diagnostic Test (RDT) positivity in children aged 6–59 months.
+   - Empirical logit variance-stabilizing transformation.
+   - Variography: Empirical semivariogram with 95% Monte Carlo envelope under Complete Spatial Randomness (CSR).
+   - Theoretical semivariogram modeling (Exponential model fit via weighted least squares).
+   - Ordinary Kriging spatial interpolation across a 5 km grid.
+   - 10-fold internal cross-validation.
+   - High-risk exposure analysis integrated with 1 km WorldPop gridded population data.
+
+Spatial data outputs are structured for seamless integration with **QGIS** for cartographic layout and publication-quality maps.
+
+---
+
+# Setup and Dependencies
+
+Load the necessary R packages for data wrangling, spatial vector/raster analysis, geostatistics, and reporting.
+
+```{r libraries}
+# Core data manipulation and visualization
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(scales)
+library(ggplot2)
+library(gt)
+library(tableone)
+
+# Spatial vector and raster handling
+library(sf)
+library(terra)
+library(tmap)
+
+# Spatial econometrics and geostatistics
+library(spdep)
+library(sp)
+library(gstat)
+library(automap)
+library(geoR)
+
+# Load custom helper functions (variogram envelopes, plotting)
+source("functions.R")
+```
+
+---
+
+# Data Ingestion and Validation
+
+We load the survey tabular data, administrative boundary shapefiles, and gridded population raster. All paths are relative to the project root directory.
+
+```{r load-data}
+# 1. Survey Data: Malaria RDT cluster results (n = 468)
+adm1_rdt <- read.csv("data/cluster_rdt.csv")
+
+# 2. Survey Data: Open defecation aggregated to Admin 2 departments (n = 106)
+adm2_def <- read.csv("data/adm2_opendef.csv")
+
+# 3. Spatial Boundaries: Admin 2 DHS shapefile
+adm2_dhs_def <- st_read("data/civ_DHS.shp", quiet = TRUE) %>%
+  clean_names()
+
+# 4. Spatial Boundaries: National (Admin 0) and Regional/District (Admin 1)
+adm0 <- st_read("data/civ_adm0.shp", quiet = TRUE)
+adm1 <- st_read("data/civ_adm1.shp", quiet = TRUE)
+
+# 5. Gridded Population: 2021 WorldPop 1km constrained population raster
+civ_pop <- rast("data/civ_pop_2021_CN_1km_R2025A_UA_v1.tif")
+
+# Quick data hygiene checks
+cat("Malaria RDT Clusters:", nrow(adm1_rdt), "| Missing values:", sum(!complete.cases(adm1_rdt)), "\n")
+cat("Open Defecation Depts:", nrow(adm2_def), "| Missing values:", sum(!complete.cases(adm2_def)), "\n")
+```
+
+---
+
+# Section 1: Exploratory Spatial Analysis of Open Defecation
+
+## Data Harmonization and Spatial Scale Selection
+
+We analyse open defecation at the **Admin 2 (department, $n = 106$)** scale. Admin 2 captures fine-grained rural–urban gradients and localized sanitation deficits that would be masked by broader regional aggregation (preventing ecological fallacy).
+
+We join the survey attributes to the spatial polygon layer and compute departmental covariates, including urban proportion derived from cluster data.
+
+```{r harmonize-sanitation}
+# Join tabular sanitation data to department spatial polygons
+full_def <- adm2_dhs_def %>%
+  inner_join(adm2_def, by = c("adm2_pcode", "dhs_region")) %>%
+  select(-n_clusters, -n_househol, -n_opendef)
+
+# Compute district-level urban proportion from cluster records
+urban_prop <- adm1_rdt %>%
+  group_by(adm1name) %>%
+  summarise(
+    urban_prop = mean(urban, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(adm1name = tolower(adm1name))
+
+# Append urban proportion to the spatial department dataset
+full_def <- full_def %>%
+  left_join(urban_prop, by = c("dhs_region" = "adm1name"))
+
+cat("Harmonized spatial dataset contains", nrow(full_def), "departments.\n")
+```
+
+## Summary Statistics
+
+### District Summary Table
+
+```{r district-summary}
+regional_summary <- full_def %>%
+  st_drop_geometry() %>%
+  group_by(dhs_region) %>%
+  summarise(
+    no_households = sum(n_hhold),
+    no_open_def   = sum(n_open),
+    avg_prop_def  = round(mean(prop_od) * 100, 2),
+    urban_prop    = round(mean(urban_prop) * 100, 2)
+  ) %>%
+  mutate(dhs_region = str_to_title(dhs_region))
+
+regions_tab <- regional_summary %>%
+  gt() %>%
+  cols_label(
+    dhs_region   = "District",
+    no_households = "Households (n)",
+    no_open_def  = "Open Defecation (n)",
+    avg_prop_def = "Open Defecation (%)",
+    urban_prop   = "Urban Coverage (%)"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) %>%
+  tab_header(
+    title = md("**District Summary of Open Defecation in Côte d'Ivoire**"),
+    subtitle = "Aggregated from 2021 DHS Survey Household Responses"
+  )
+
+regions_tab
+```
+
+### Department-Level Descriptive Statistics
+
+Due to skewness in proportion data, we present non-parametric medians and interquartile ranges (IQR).
+
+```{r tableone-summary}
+summary_vars <- full_def %>% st_drop_geometry()
+nonnormal_vars <- c("urban_prop", "prop_od")
+
+tab1 <- CreateTableOne(vars = nonnormal_vars, data = summary_vars)
+tab_sum <- as.data.frame(print(tab1, nonnormal = nonnormal_vars, printToggle = FALSE))
+tab_sum$Variable <- rownames(tab_sum)
+tab_sum <- tab_sum %>% select(Variable, Overall)
+
+totals <- data.frame(
+  Variable = c("n_hhold", "n_open"),
+  Overall = c(
+    format(sum(summary_vars$n_hhold, na.rm = TRUE), big.mark = ","),
+    format(sum(summary_vars$n_open, na.rm = TRUE), big.mark = ",")
+  )
+)
+
+tab_combined <- bind_rows(
+  tab_sum %>% filter(Variable == "n"),
+  totals,
+  tab_sum %>% filter(Variable != "n")
+)
+
+tableone_gt <- tab_combined %>%
+  mutate(Variable = case_when(
+    Variable == "n" ~ "Number of Departments",
+    grepl("n_hhold", Variable) ~ "Households Surveyed",
+    grepl("n_open", Variable) ~ "Households Reporting Open Defecation",
+    grepl("urban_prop", Variable) ~ "Urban Household Proportion",
+    grepl("prop_od", Variable) ~ "Open Defecation Proportion"
+  )) %>%
+  gt() %>%
+  cols_label(
+    Variable = "Characteristic",
+    Overall = "Overall (Median [IQR] / Total)"
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) %>%
+  tab_header(
+    title = md("**Descriptive Statistics: Open Defecation (Admin 2)**"),
+    subtitle = "Department-level summary (n = 106)"
+  )
+
+tableone_gt
+```
+
+## Exploratory Data Distribution
+
+The department-level open defecation proportion exhibits pronounced right-skewness, with many departments having low proportions and a substantial tail of high-burden rural departments.
+
+```{r distribution-plot}
+dist_alone <- ggplot(full_def, aes(x = prop_od)) +
+  geom_histogram(binwidth = 0.05, fill = "#8B1E3F", colour = "white", alpha = 0.9) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Distribution of Department Open Defecation Proportions",
+    subtitle = "Right-skewed distribution across 106 departments",
+    x = "Proportion of Households Practicing Open Defecation",
+    y = "Frequency (Departments)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+dist_alone
+
+# Association between urbanization and open defecation
+region_scat <- ggplot(regional_summary, aes(x = urban_prop, y = avg_prop_def)) +
+  geom_point(size = 3.5, color = "#2B5B84", alpha = 0.85) +
+  geom_smooth(method = "lm", se = FALSE, color = "#C0392B", linewidth = 1.2) +
+  scale_x_continuous(limits = c(0, 100), labels = function(x) paste0(x, "%")) +
+  scale_y_continuous(limits = c(0, 60), labels = function(x) paste0(x, "%")) +
+  labs(
+    title = "Urban Coverage vs. Open Defecation Prevalence",
+    subtitle = "Strong negative ecological association across districts",
+    x = "Average Urban Coverage (%)",
+    y = "Average Open Defecation Prevalence (%)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+region_scat
+```
+
+## Thematic Map Preview
+
+```{r tmap-choropleth}
+# Fast thematic map check
+tm_shape(full_def) +
+  tm_polygons(
+    fill = "prop_od",
+    fill.scale = tm_scale_intervals(style = "quantile", n = 5, values = "-brewer.spectral"),
+    fill.legend = tm_legend(title = "Open Defecation\nProportion (Quantiles)"),
+    col = "grey30",
+    lwd = 0.3
+  ) +
+  tm_layout(frame = FALSE)
+```
+
+## Spatial Autocorrelation Analysis
+
+### Defining Spatial Neighbours and Spatial Weights
+
+We define spatial neighbours using **Queen contiguity** (units sharing a common boundary or point vertex). Queen contiguity ensures all 106 departments have neighbours (mean = 5.25 links per department). 
+
+We apply **row-standardized weights (`style = "W"`)**, so each neighbour contributes equally to the spatial lag ($W z_i$), preventing departments with many neighbours from dominating the variance.
+
+```{r spatial-weights}
+# Extract polygon contiguity neighbours
+neighbours <- poly2nb(full_def, queen = TRUE)
+summary(neighbours)
+
+# Compute centroids for connectivity network visualisation
+cote_centroids <- st_centroid(full_def)
+
+# Generate row-standardized spatial weights matrix
+weights_queen <- nb2listw(neighbours, style = "W", zero.policy = TRUE)
+
+# Plot neighbour connectivity network
+plot(st_geometry(full_def), border = "grey60", lwd = 0.5, main = "Queen Contiguity Spatial Weights Network (n = 106)")
+plot(neighbours, st_coordinates(cote_centroids), col = "royalblue3", cex = 0.4, lwd = 1, add = TRUE)
+```
+
+### Global Moran's $I$ Test
+
+We evaluate global spatial autocorrelation using Moran's $I$. We test significance against the null hypothesis of Complete Spatial Randomness (CSR) using both the analytical normal approximation and **9,999 Monte Carlo permutations**.
+
+```{r global-moran}
+# Analytical Global Moran's I test
+def_moran <- moran.test(full_def$prop_od, listw = weights_queen, zero.policy = TRUE)
+def_moran
+
+# Standardize variables and compute spatial lag
+full_def <- full_def %>%
+  mutate(
+    scale_prop_od = as.numeric(scale(prop_od)),
+    lag_scaled_prop_od = lag.listw(weights_queen, scale_prop_od, zero.policy = TRUE)
+  )
+
+# Monte Carlo permutation test (9,999 iterations)
+set.seed(42)
+mc_moran <- moran.mc(full_def$prop_od, listw = weights_queen, nsim = 9999, zero.policy = TRUE)
+mc_moran
+
+# Moran's I Scatterplot
+moran_stat <- round(def_moran$estimate[1], 3)
+stat_label <- paste0("Global Moran's I = ", moran_stat, "\n(p < 0.001)")
+
+global_moran_scat <- ggplot(full_def, aes(x = scale_prop_od, y = lag_scaled_prop_od)) +
+  geom_point(color = "#1F4E79", size = 3, alpha = 0.8) +
+  geom_smooth(method = "lm", color = "#C0392B", se = FALSE, linewidth = 1.1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  annotate("text", x = 1.2, y = -1.2, label = stat_label, hjust = 0, size = 5.5, fontface = "bold", color = "#C0392B") +
+  labs(
+    title = "Moran's I Scatterplot of Open Defecation in Côte d'Ivoire",
+    subtitle = "Positive spatial autocorrelation indicates significant geographical clustering",
+    x = "Standardised Open Defecation Proportion (Z-score)",
+    y = "Spatially Lagged Standardised Proportion (Wz)"
+  ) +
+  theme_minimal(base_size = 14)
+
+global_moran_scat
+```
+
+```{r mc-simulation-plot}
+mc_moran_df <- data.frame(residuals = mc_moran$res)
+
+mc_global_moran <- ggplot(mc_moran_df, aes(x = residuals)) +
+  geom_histogram(colour = "gray20", fill = "coral1", alpha = 0.75, binwidth = 0.015) +
+  geom_vline(xintercept = def_moran$estimate[1], colour = "red", linewidth = 1.2, linetype = "solid") +
+  annotate("text", x = 0.08, y = 500, label = paste("Observed I = 0.29\nPseudo p < 0.001"), 
+           hjust = 0, size = 5, fontface = "bold", color = "darkred") +
+  labs(
+    title = "Monte Carlo Permutation Distribution (9,999 Simulations)",
+    subtitle = "Observed statistic lies entirely outside the empirical null distribution",
+    x = "Permuted Moran's I Residuals",
+    y = "Permutation Count"
+  ) +
+  theme_bw(base_size = 14)
+
+mc_global_moran
+```
+
+### Local Moran's $I$ (LISA) Cluster Analysis
+
+Global Moran's $I$ detects overall clustering but masks local hotspots and spatial outliers. We compute Anselin's **Local Moran's $I$ (LISA)** to classify each department into four spatial quadrants:
+- **High-High (Hotspots)**: High open defecation surrounded by high open defecation.
+- **Low-Low (Coldspots)**: Low open defecation surrounded by low open defecation.
+- **Low-High (Spatial Outliers)**: Low open defecation surrounded by high open defecation.
+- **High-Low (Spatial Outliers)**: High open defecation surrounded by low open defecation.
+
+```{r local-moran}
+local_moran <- localmoran(full_def$prop_od, weights_queen, zero.policy = TRUE, alternative = "two.sided")
+colnames(local_moran) <- c("local_I", "expected_I", "variance_I", "z_statistic", "p_value")
+
+# Combine results with spatial geometries
+full_def$p_value <- local_moran[, "p_value"]
+
+# LISA classification function
+classify_lisa <- function(data, alpha = 0.05) {
+  data %>%
+    mutate(
+      cluster = case_when(
+        p_value > alpha ~ "Not Significant",
+        scale_prop_od > 0 & lag_scaled_prop_od > 0 ~ "High-High",
+        scale_prop_od <= 0 & lag_scaled_prop_od <= 0 ~ "Low-Low",
+        scale_prop_od > 0 & lag_scaled_prop_od <= 0 ~ "High-Low",
+        scale_prop_od <= 0 & lag_scaled_prop_od > 0 ~ "Low-High"
+      ),
+      cluster = factor(cluster, levels = c("High-High", "Low-Low", "High-Low", "Low-High", "Not Significant"))
+    )
+}
+
+lisa_05 <- classify_lisa(full_def, alpha = 0.05)
+lisa_01 <- classify_lisa(full_def, alpha = 0.01)
+
+table("LISA Classification (p <= 0.05)" = lisa_05$cluster)
+table("LISA Classification (p <= 0.01)" = lisa_01$cluster)
+```
+
+```{r lisa-scatter-plot}
+lisa_scat <- ggplot(lisa_05, aes(x = scale_prop_od, y = lag_scaled_prop_od, color = cluster)) +
+  geom_point(size = 3.5, alpha = 0.85) +
+  geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.8) +
+  geom_hline(yintercept = 0, color = "gray40", linetype = "dotted") +
+  geom_vline(xintercept = 0, color = "gray40", linetype = "dotted") +
+  scale_color_manual(
+    values = c(
+      "High-High" = "#E74C3C", 
+      "Low-Low" = "#2980B9", 
+      "High-Low" = "#E67E22", 
+      "Low-High" = "#5DADE2", 
+      "Not Significant" = "grey80"
+    ),
+    name = "LISA Typology"
+  ) +
+  labs(
+    title = "Local Moran's I Scatter Plot of Open Defecation in Côte d'Ivoire",
+    subtitle = "Spatial Clusters and Outliers at p <= 0.05",
+    x = "Standardised Open Defecation Proportion (Z-score)",
+    y = "Spatially Lagged Average Z-score"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right")
+
+lisa_scat
+```
+
+```{r export-part1-gis}
+# Export GeoJSON layers for publication cartography in QGIS
+st_write(lisa_05, "morans_i_local2_05.geojson", delete_dsn = TRUE, quiet = TRUE)
+st_write(lisa_01, "morans_i_local2_01.geojson", delete_dsn = TRUE, quiet = TRUE)
+cat("Section 1 spatial vectors exported for QGIS mapping.\n")
+```
+
+---
+
+# Section 2: Geostatistical Modeling of Childhood Malaria
+
+## Data Description and Exploratory Analysis
+
+The malaria dataset consists of **468 survey clusters** where children aged 6–59 months were tested using Rapid Diagnostic Tests (RDTs).
+
+```{r malaria-exploratory}
+# Compute cluster-level prevalence and household coverage metrics
+adm1_rdt <- adm1_rdt %>%
+  mutate(
+    rdt_prev_child = round(n_rdt_pos / n_child, 3),
+    prop_child_hhold = round(n_child / n_hholds, 3)
+  )
+
+# Overall summary statistics
+prev_summary <- adm1_rdt %>%
+  summarise(
+    n_clusters     = n(),
+    n_urban        = sum(urban == 1, na.rm = TRUE),
+    n_rural        = sum(urban == 0, na.rm = TRUE),
+    sum_hh         = sum(n_hholds),
+    sum_ch         = sum(n_child),
+    sum_rdt        = sum(n_rdt_pos),
+    prev_mean      = round(mean(rdt_prev_child, na.rm = TRUE), 2),
+    prev_q1        = round(quantile(rdt_prev_child, 0.25, na.rm = TRUE), 2),
+    prev_q3        = round(quantile(rdt_prev_child, 0.75, na.rm = TRUE), 2)
+  ) %>%
+  mutate(prev_formatted = sprintf("%.2f (%.2f–%.2f)", prev_mean, prev_q1, prev_q3))
+
+prev_summary_gt <- prev_summary %>%
+  select(n_clusters, n_urban, n_rural, sum_hh, sum_ch, sum_rdt, prev_formatted) %>%
+  pivot_longer(everything(), names_to = "Indicator", values_to = "Value", values_transform = list(Value = as.character)) %>%
+  mutate(Indicator = recode(
+    Indicator,
+    n_clusters = "Survey Clusters (n)",
+    n_urban = "Urban Clusters (n)",
+    n_rural = "Rural Clusters (n)",
+    sum_hh = "Households Surveyed (n)",
+    sum_ch = "Children Tested (6–59 months)",
+    sum_rdt = "Positive RDT Results (n)",
+    prev_formatted = "Cluster Prevalence: Mean (IQR)"
+  )) %>%
+  gt() %>%
+  cols_label(Indicator = "Survey Metric", Value = "Estimate") %>%
+  tab_header(
+    title = md("**Summary of DHS 2021 Malaria RDT Screening**"),
+    subtitle = "Children aged 6–59 months in Côte d'Ivoire"
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels(everything()))
+
+prev_summary_gt
+```
+
+### Rural vs. Urban Disparities
+
+```{r rural-urban-plot}
+urban_rdt <- ggplot(adm1_rdt, aes(x = factor(urban, labels = c("Rural", "Urban")), y = rdt_prev_child, fill = factor(urban))) +
+  geom_violin(trim = FALSE, alpha = 0.6, colour = "grey30") +
+  geom_boxplot(width = 0.18, outlier.shape = NA, fill = "white", colour = "black") +
+  scale_fill_manual(values = c("Rural" = "#E67E22", "Urban" = "#3498DB"), guide = "none") +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Childhood Malaria Prevalence: Rural vs. Urban Clusters",
+    subtitle = "Rural clusters exhibit substantially higher endemicity (median 53% vs. 17%)",
+    x = "Locality Classification",
+    y = "Cluster RDT Positivity Rate (%)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+urban_rdt
+```
+
+## Empirical Logit Transformation
+
+Cluster-level proportions are bounded on $[0, 1]$ and heteroscedastic. To meet the assumptions of stationary Gaussian random fields for geostatistical interpolation, we transform cluster prevalence to the **empirical logit scale**:
+
+$$\text{logit}(p_i) = \ln\left(\frac{y_i + 0.5}{n_i - y_i + 0.5}\right)$$
+
+where $y_i$ is the number of positive children and $n_i$ is the total children tested in cluster $i$. Adding $0.5$ avoids division by zero for clusters with 0% or 100% test positivity.
+
+```{r empirical-logit}
+# Empirical logit transformation
+adm1_rdt <- adm1_rdt %>%
+  mutate(
+    logitp = log((n_rdt_pos + 0.5) / (n_child - n_rdt_pos + 0.5))
+  )
+
+# Verify transformed distribution
+hist(
+  adm1_rdt$logitp,
+  breaks = 20,
+  col = "slateblue4",
+  border = "white",
+  main = "Empirical Logit Transformation of Malaria Prevalence",
+  xlab = "Empirical Logit Prevalence"
+)
+```
+
+## Spatial Dependence and Variography
+
+We reproject cluster points to **EPSG:3857 (WGS 84 / Pseudo-Mercator, units in meters)** to ensure Euclidean distance calculations in meters.
+
+```{r variography}
+# Convert clusters to projected sf object
+adm1_rdt_sp <- adm1_rdt %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 3857)
+
+# Compute empirical semivariogram with 95% Monte Carlo envelope
+emp_var_plot <- ggvario(
+  coords = st_coordinates(adm1_rdt_sp),
+  data = adm1_rdt_sp$logitp,
+  bins = 15,
+  nsim = 999,
+  color = "royalblue1",
+  xlab = "Distance (meters)"
+)
+
+emp_var_plot
+```
+
+### Theoretical Semivariogram Model Fitting
+
+Using `automap::autofitVariogram`, we fit candidate semivariogram models (Spherical, Exponential, Gaussian) via weighted least squares.
+
+```{r fit-variogram}
+adm1_spatial <- as(adm1_rdt_sp, "Spatial")
+
+variofit <- autofitVariogram(
+  formula = logitp ~ 1,
+  input_data = adm1_spatial,
+  model = c("Exp", "Sph", "Gau")
+)
+
+plot(variofit)
+
+# Extract fitted parameters
+vgm_model <- variofit$var_model
+nugget_val <- vgm_model$psill[vgm_model$model == "Nug"]
+partial_sill <- vgm_model$psill[vgm_model$model != "Nug"]
+total_sill <- nugget_val + partial_sill
+range_param_km <- vgm_model$range[vgm_model$model != "Nug"] / 1000
+practical_range_km <- 3 * range_param_km # For exponential model: ~3 * a
+
+vgm_summary_table <- tibble(
+  Parameter = c("Best Model", "Nugget", "Partial Sill", "Total Sill", "Spatial Variance Ratio (%)", "Range Parameter", "Practical Range"),
+  Value     = c(
+    as.character(vgm_model$model[vgm_model$model != "Nug"]),
+    sprintf("%.2f", nugget_val),
+    sprintf("%.2f", partial_sill),
+    sprintf("%.2f", total_sill),
+    sprintf("%.1f%%", (partial_sill / total_sill) * 100),
+    sprintf("%.2f km", range_param_km),
+    sprintf("%.2f km", practical_range_km)
+  )
+)
+
+vgm_summary_table %>%
+  gt() %>%
+  cols_label(Parameter = "Variogram Parameter", Value = "Estimated Value") %>%
+  tab_header(title = md("**Fitted Theoretical Semivariogram Parameters**")) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels(everything()))
+```
+
+## Ordinary Kriging Spatial Interpolation
+
+We define a regular **5 km prediction grid** across the national territory of Côte d'Ivoire. We execute Ordinary Kriging on the empirical logit scale, then back-transform predictions and 95% confidence bounds to the prevalence scale.
+
+$$\hat{p}(s_0) = \text{logit}^{-1}(\hat{Z}(s_0)) = \frac{1}{1 + \exp(-\hat{Z}(s_0))}$$
+
+```{r ordinary-kriging}
+# Project national boundary to match spatial CRS
+adm0_proj <- st_transform(adm0, 3857)
+study_area <- st_make_valid(adm0_proj) %>% st_union()
+
+# Generate 5km regular prediction grid points
+pred_grid <- st_make_grid(study_area, cellsize = 5000, what = "centers") %>%
+  st_as_sf()
+
+# Mask grid to exact national boundary
+pred_locations <- pred_grid[st_within(pred_grid, study_area, sparse = FALSE)[, 1], ]
+
+cat("Prediction grid points within national boundary:", nrow(pred_locations), "\n")
+
+# Run Ordinary Kriging using fitted variogram
+orkriging <- autoKrige(
+  formula    = logitp ~ 1,
+  input_data = adm1_spatial,
+  new_data   = as(pred_locations, "Spatial"),
+  model      = c("Exp", "Sph", "Gau"),
+  verbose    = FALSE
+)
+
+# Extract predictions and standard errors on logit scale
+pred_logit <- orkriging$krige_output$var1.pred
+pred_se    <- orkriging$krige_output$var1.stdev
+
+# Back-transform to prevalence scale
+pred_prevalence <- plogis(pred_logit)
+lower_ci        <- plogis(pred_logit - 1.96 * pred_se)
+upper_ci        <- plogis(pred_logit + 1.96 * pred_se)
+ci_width        <- upper_ci - lower_ci
+
+# Assemble prediction dataframe
+coords_grid <- st_coordinates(pred_locations)
+pred_df <- data.frame(
+  x          = coords_grid[, 1],
+  y          = coords_grid[, 2],
+  prevalence = pred_prevalence,
+  lower      = lower_ci,
+  upper      = upper_ci,
+  ci_width   = ci_width
+)
+
+# Rasterize continuous surfaces
+pred_rast <- terra::rast(pred_df, type = "xyz", crs = st_crs(adm1_rdt_sp)$wkt)
+study_area_vect <- terra::vect(study_area)
+pred_rast <- terra::crop(pred_rast, study_area_vect)
+pred_rast <- terra::mask(pred_rast, study_area_vect)
+
+# Export kriging prediction raster for QGIS cartography
+writeRaster(pred_rast, "kriging_prevalence_ci2.tif", overwrite = TRUE)
+cat("Kriging raster surfaces successfully generated and exported.\n")
+```
+
+## Model Validation: 10-Fold Cross-Validation
+
+We assess predictive accuracy using **10-fold cross-validation** with `automap::autoKrige.cv`.
+
+```{r cross-validation}
+set.seed(123)
+cv_res <- autoKrige.cv(
+  formula = logitp ~ 1,
+  input_data = adm1_spatial,
+  nfold = 10,
+  verbose = c(FALSE, FALSE),
+  model = c("Exp", "Sph", "Gau")
+)
+
+comp_cv <- compare.cv(cv_res, col.names = c("Value"))
+
+cv_summary <- as.data.frame(comp_cv) %>%
+  tibble::rownames_to_column("Metric") %>%
+  mutate(Metric = c(
+    "Mean Error (ME)",
+    "Mean Error Normalised (MEN)",
+    "Mean Absolute Error (MAE)",
+    "Mean Squared Error (MSE)",
+    "Mean Squared Normalised Error (MSNE)",
+    "Correlation (Observed vs Predicted)",
+    "Correlation (Predicted vs Residual)",
+    "Root Mean Squared Error (RMSE)",
+    "RMSE SD",
+    "Unbiased RMSE",
+    "Interquartile Range of Residuals"
+  )) %>%
+  gt() %>%
+  cols_label(Metric = "Cross-Validation Metric", Value = "Value") %>%
+  fmt_number(columns = Value, decimals = 3) %>%
+  tab_header(
+    title = md("**10-Fold Internal Cross-Validation Results**"),
+    subtitle = "Evaluation of Ordinary Kriging Predictive Accuracy"
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels(everything()))
+
+cv_summary
+```
+
+---
+
+# Section 3: Population at Risk Using Gridded Population Data
+
+Public health intervention planning requires combining continuous epidemiological risk surfaces with high-resolution human settlement distribution.
+
+We integrate the kriged malaria prevalence surface with the **WorldPop 1 km gridded population dataset**.
+
+## Defining the High-Risk Endemicity Threshold
+
+Because there is no universally defined singular threshold for malaria endemicity, we define high risk as the **80th percentile of predicted prevalence** ($\ge 0.54$, or 54% prevalence). This empirical cut-off targets the highest-burden quintile for prioritized intervention.
+
+```{r population-integration}
+# Extract rasters
+prev_rast  <- pred_rast[["prevalence"]]
+lower_rast <- pred_rast[["lower"]]
+upper_rast <- pred_rast[["upper"]]
+
+# Align and resample rasters to match WorldPop grid
+pop_proj <- project(civ_pop, crs(prev_rast))
+prev_resamp  <- resample(prev_rast, pop_proj, method = "bilinear")
+lower_resamp <- resample(lower_rast, pop_proj, method = "bilinear")
+upper_resamp <- resample(upper_rast, pop_proj, method = "bilinear")
+
+# Calculate empirical 80th percentile threshold
+thr_80 <- global(prev_resamp, quantile, probs = 0.8, na.rm = TRUE)[1, 1]
+cat("80th Percentile High-Risk Threshold:", round(thr_80, 4), "prevalence\n")
+
+# Binary high-risk mask and population at risk
+highrisk_mask <- prev_resamp >= thr_80
+pop_highrisk  <- pop_proj * highrisk_mask
+names(pop_highrisk) <- "pop_highrisk"
+
+# National summary totals
+nat_high_pop  <- global(pop_highrisk, "sum", na.rm = TRUE)[1, 1]
+nat_total_pop <- global(pop_proj, "sum", na.rm = TRUE)[1, 1]
+nat_pct_high  <- 100 * (nat_high_pop / nat_total_pop)
+
+cat(sprintf("National Population in High-Risk Areas: %.2f million (%.2f%% of total)\n", 
+            nat_high_pop / 1e6, nat_pct_high))
+```
+
+## District-Level Zonal Population Summaries
+
+We dissolve DHS department boundaries into 14 administrative districts and compute zonal sums of total population and population residing within high-risk malaria zones.
+
+```{r district-zonal-stats}
+# Dissolve departments into districts
+adm_district <- adm2_dhs_def %>%
+  group_by(dhs_region) %>%
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Project vector layer to raster CRS
+adm_district_v <- project(vect(adm_district), crs(pop_proj))
+
+# Extract zonal sums
+adm_district$pop_total    <- extract(pop_proj, adm_district_v, fun = sum, na.rm = TRUE)[, 2]
+adm_district$pop_highrisk <- extract(pop_highrisk, adm_district_v, fun = sum, na.rm = TRUE)[, 2]
+
+# Format district table
+adm1_tbl <- adm_district %>%
+  st_drop_geometry() %>%
+  mutate(
+    pct_highrisk = round(100 * pop_highrisk / pop_total, 2),
+    dhs_region   = str_to_title(dhs_region)
+  ) %>%
+  arrange(desc(pop_highrisk))
+
+# National total row
+national_row <- tibble(
+  dhs_region   = "Côte d'Ivoire (Total)",
+  pop_total    = sum(adm1_tbl$pop_total, na.rm = TRUE),
+  pop_highrisk = sum(adm1_tbl$pop_highrisk, na.rm = TRUE),
+  pct_highrisk = round(100 * sum(adm1_tbl$pop_highrisk, na.rm = TRUE) / sum(adm1_tbl$pop_total, na.rm = TRUE), 2)
+)
+
+adm1_tbl_final <- bind_rows(adm1_tbl, national_row)
+
+district_risk_gt <- adm1_tbl_final %>%
+  gt() %>%
+  cols_label(
+    dhs_region   = "District",
+    pop_total    = "Total Population",
+    pop_highrisk = "Population in High-Risk Zones",
+    pct_highrisk = "Proportion at High Risk (%)"
+  ) %>%
+  fmt_scientific(columns = c(pop_total, pop_highrisk), decimals = 2) %>%
+  fmt_number(columns = pct_highrisk, decimals = 2) %>%
+  tab_header(
+    title = md("**Populations Living in High-Risk Malaria Areas in Côte d'Ivoire**"),
+    subtitle = paste0("High risk defined as predicted prevalence >= ", round(thr_80, 2), " (80th percentile)")
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = list(cells_column_labels(everything()), cells_body(rows = dhs_region == "Côte d'Ivoire (Total)"))
+  ) %>%
+  tab_style(
+    style = cell_borders(sides = "top", color = "black", weight = px(2)),
+    locations = cells_body(rows = dhs_region == "Côte d'Ivoire (Total)")
+  )
+
+district_risk_gt
+```
+
+### District High-Risk Population Chart
+
+```{r district-risk-barchart}
+high_risk_chart <- adm1_tbl %>%
+  ggplot(aes(x = reorder(dhs_region, pop_highrisk), y = pop_highrisk)) +
+  geom_col(fill = "lightsalmon2", color = "grey40") +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Population Living in High-Risk Malaria Zones by District",
+    subtitle = paste0("High risk: predicted prevalence >= ", round(thr_80, 2), " (top 20% national quintile)"),
+    x = "District",
+    y = "Population at Risk"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+high_risk_chart
+```
+
+## Sensitivity Analysis: Incorporating Prediction Uncertainty
+
+To account for prediction error, we evaluate exposure under the **lower 95% confidence bound** (conservative: certainly high risk) and **upper 95% confidence bound** (inclusive: plausibly high risk).
+
+```{r uncertainty-sensitivity}
+pop_high_lower <- pop_proj * (lower_resamp >= thr_80)
+pop_high_upper <- pop_proj * (upper_resamp >= thr_80)
+
+nat_low_pop <- global(pop_high_lower, "sum", na.rm = TRUE)[1, 1]
+nat_up_pop  <- global(pop_high_upper, "sum", na.rm = TRUE)[1, 1]
+
+tibble(
+  Scenario = c("Conservative (Lower 95% Bound >= Threshold)", "Expected (Point Prediction >= Threshold)", "Inclusive (Upper 95% Bound >= Threshold)"),
+  `Population at Risk` = c(nat_low_pop, nat_high_pop, nat_up_pop),
+  `National Percentage (%)` = c(100 * nat_low_pop / nat_total_pop, nat_pct_high, 100 * nat_up_pop / nat_total_pop)
+) %>%
+  gt() %>%
+  fmt_number(columns = `Population at Risk`, decimals = 0) %>%
+  fmt_number(columns = `National Percentage (%)`, decimals = 2) %>%
+  tab_header(
+    title = md("**Sensitivity Analysis: Kriging Uncertainty & Population Exposure**"),
+    subtitle = "Evaluating risk threshold against 95% prediction confidence intervals"
+  ) %>%
+  tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels(everything()))
+```
+
+```{r export-rasters-qgis}
+# Export aligned GeoTIFFs for publication-quality map composition in QGIS
+writeRaster(prev_resamp, "prevalence_aligned.tif", overwrite = TRUE)
+writeRaster(highrisk_mask, "highrisk_mask.tif", overwrite = TRUE)
+writeRaster(pop_highrisk, "pop_highrisk.tif", overwrite = TRUE)
+writeRaster(pop_high_lower, "pop_highrisk_lower.tif", overwrite = TRUE)
+writeRaster(pop_high_upper, "pop_highrisk_upper.tif", overwrite = TRUE)
+
+# Export district boundaries GeoPackage
+st_write(adm_district, "adm_district.gpkg", layer = "adm_district", delete_layer = TRUE, quiet = TRUE)
+cat("All final geostatistical surfaces exported for QGIS cartography.\n")
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```

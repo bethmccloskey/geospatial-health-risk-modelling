@@ -1,0 +1,55 @@
+# ==============================================================================
+# .gitignore for Spatial Epidemiology Portfolio Repository
+# ==============================================================================
+
+# --- QGIS Project Files, Working Maps & Locks ---
+# QGIS files contain local machine paths and data bindings that break on other machines
+*.qgz
+*.qgs
+*.qgz~
+*.qgs~
+QGIS maps/
+
+# --- R-Generated Exploratory Plots & Table Snapshots ---
+# These are generated directly by running the R scripts; kept on local disk but excluded from git
+figures/fig*.png
+figures/tab*.png
+
+# Restricted survey datasets and exported tabular summaries
+data/
+civ_adm0_files/
+civ_adm1_files/
+*.csv
+
+# Large generated spatial rasters, vectors, and geodatabases
+*.tif
+*.tif.aux.xml
+*.gpkg
+*.geojson
+
+# --- University Assessment Submissions, Briefs & Exam Materials ---
+# Protects student privacy, candidate numbers, and prevents Turnitin plagiarism flags
+*Cover Sheet*
+*cover sheet*
+*Candidate*
+*ssessment details/
+*Assessment details/
+*Assessment description*
+*assessment*pdf
+*Assessment*pdf
+*.docx
+*.pptx
+
+# --- R Session Artifacts & Duplicate Export Files ---
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata/
+assessment_script_files/
+assessment_script_r.R
+
+# --- OS & System Files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
