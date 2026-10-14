@@ -242,8 +242,8 @@ Below is a complete guide to all cartographic map layouts exported in `figures/`
 │   ├── map09_population_exposed_high_risk_zones.png        # Population exposed in high-risk zones (Fig 16A)
 │   └── map10_predicted_prevalence_with_high_risk_boundary.png # Predicted prevalence with high-risk boundary (Fig 16B)
 ├── functions.R                                             # Custom R functions (variogram envelopes, plotting)
-├── assessment_script.R                                     # Standalone runnable R analysis script
-├── assessment_script.Rmd                                   # Fully annotated R Markdown analytical notebook
+├── r_script.R                                              # Standalone runnable R analysis script
+├── r_markdown_script.Rmd                                   # Fully annotated R Markdown analytical notebook
 ├── .gitignore                                              # Excludes raw data, exploratory plots, TIFF rasters, & academic files
 └── README.md                                               # Project documentation and portfolio presentation
 ```
@@ -259,14 +259,14 @@ To reproduce this analysis locally, request access to the **2021 Côte d'Ivoire 
 To execute the complete analysis pipeline from the terminal:
 
 ```bash
-Rscript assessment_script.R
+Rscript r_script.R
 ```
 
 ### Option B: Render the R Markdown Notebook
-Open `assessment_script.Rmd` in RStudio and click **Knit**, or execute in R:
+Open `r_markdown_script.Rmd` in RStudio and click **Knit**, or execute in R:
 
 ```r
-rmarkdown::render("assessment_script.Rmd")
+rmarkdown::render("r_markdown_script.Rmd")
 ```
 
 ---
