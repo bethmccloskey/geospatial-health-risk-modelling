@@ -19,14 +19,6 @@ This repository presents an end-to-end spatial epidemiological investigation of 
 1. **Household Sanitation & Open Defecation (SDG 6.2):** Spatial patterns and local clustering of open defecation across 106 administrative departments (Admin 2).
 2. **Childhood Malaria Endemicity (SDG 3.3):** Geostatistical surface modeling of Rapid Diagnostic Test (RDT) positivity in children aged 6–59 months across 468 survey clusters, coupled with high-resolution gridded population data (WorldPop 1 km) to quantify populations exposed to high transmission risk.
 
-### The Hybrid R + QGIS Workflow
-
-In epidemiological research and humanitarian health informatics (e.g., LSHTM, WHO, CDC, UNICEF), data scientists combine **statistical computing environments** with **dedicated GIS software**:
-- **R (`sf`, `terra`, `spdep`, `gstat`, `automap`, `geoR`)** executes rigorous spatial econometrics, Monte Carlo hypothesis testing, variance-stabilizing transformations, variogram fitting, ordinary kriging, and zonal extractions.
-- **QGIS (3.x)** provides publication-standard cartographic production, multi-layered visual hierarchies, exact coordinate layout grids, and print-ready thematic maps.
-
-All spatial outputs produced in R (GeoTIFFs, GeoPackages, GeoJSONs) are pre-configured to load directly into the included QGIS project files (`.qgz`).
-
 ---
 
 ## Table of Contents
